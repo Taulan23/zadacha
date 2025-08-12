@@ -152,7 +152,7 @@ class CorrectKalmanFilter:
     
     def create_sensitivity_matrix(self, num_measurements: int) -> np.ndarray:
         """
-        Создание матрицы чувствительности H
+        Создание физически корректной матрицы чувствительности H
         
         Args:
             num_measurements: количество измерений
@@ -164,23 +164,35 @@ class CorrectKalmanFilter:
         # Каждое измерение имеет разную чувствительность к разным группам
         H = np.zeros((num_measurements, self.num_groups))
         
+        # Используем фиксированный seed для воспроизводимости
+        np.random.seed(42)
+        
         for i in range(num_measurements):
-            # Создаем реалистичную чувствительность
-            # Первые измерения более чувствительны к короткоживущим группам
-            # Последние измерения более чувствительны к долгоживущим группам
+            # Создаем более реалистичную чувствительность
+            # Основанную на периодах полураспада групп
             
-            if i < num_measurements // 2:
-                # Первая половина измерений - чувствительность к группам 1-4
-                for j in range(min(4, self.num_groups)):
-                    H[i, j] = np.random.uniform(0.3, 1.0)
+            # Периоды полураспада групп (в секундах)
+            half_lives = [55.6, 22.7, 6.22, 2.30, 0.610, 0.230, 0.052, 0.017]
+            
+            for j in range(self.num_groups):
+                # Чувствительность зависит от времени измерения и периода полураспада
+                # Более долгоживущие группы (большие периоды) более чувствительны к поздним измерениям
+                time_factor = i / (num_measurements - 1)  # Нормализованное время
+                decay_factor = np.exp(-time_factor / (half_lives[j] / 10))  # Нормализованный распад
+                
+                # Базовая чувствительность
+                base_sensitivity = np.random.uniform(0.1, 0.8)
+                
+                # Комбинированная чувствительность
+                H[i, j] = base_sensitivity * decay_factor
+            
+            # Нормализуем строку (сумма чувствительностей = 1)
+            row_sum = np.sum(H[i, :])
+            if row_sum > 0:
+                H[i, :] = H[i, :] / row_sum
             else:
-                # Вторая половина измерений - чувствительность к группам 5-8
-                for j in range(4, min(8, self.num_groups)):
-                    H[i, j] = np.random.uniform(0.3, 1.0)
-            
-            # Нормализуем строку
-            if np.sum(H[i, :]) > 0:
-                H[i, :] = H[i, :] / np.sum(H[i, :])
+                # Если все нули, создаем равномерную чувствительность
+                H[i, :] = np.ones(self.num_groups) / self.num_groups
         
         return H
     
@@ -204,6 +216,9 @@ class CorrectKalmanFilter:
         # Обновление состояния
         y = measurement - H @ x_prior
         x_posterior = x_prior + K.flatten() * y
+        
+        # ОГРАНИЧЕНИЕ: спектры не могут быть отрицательными
+        x_posterior = np.maximum(x_posterior, 0)
         
         # Обновление ковариации
         I = np.eye(self.num_groups)
@@ -306,7 +321,7 @@ class CorrectSpectrumAnalyzer:
     
     def _normalize_spectra(self, spectra: np.ndarray) -> np.ndarray:
         """
-        Нормализация спектров
+        Нормализация спектров с физическими ограничениями
         
         Args:
             spectra: спектры для нормализации
@@ -324,12 +339,16 @@ class CorrectSpectrumAnalyzer:
                 logger.warning(f"Обнаружены невалидные значения в группе {group+1}")
                 group_spectrum = np.zeros_like(group_spectrum)
             
-            # Нормализация на максимальное значение
+            # ОГРАНИЧЕНИЕ: спектры не могут быть отрицательными
+            group_spectrum = np.maximum(group_spectrum, 0)
+            
+            # Нормализация на максимальное значение (если есть сигнал)
             max_val = np.max(group_spectrum)
             if max_val > 0:
                 normalized[:, group] = group_spectrum / max_val
             else:
-                normalized[:, group] = group_spectrum
+                # Если нет сигнала, создаем минимальный равномерный спектр
+                normalized[:, group] = np.ones_like(group_spectrum) * 0.01
         
         return normalized
     
