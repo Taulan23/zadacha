@@ -1,6 +1,5 @@
 """
-Правильная версия анализатора, решающая систему уравнений
-N^l_i(E_n) = Σ A^l_ij · x_j(E_n)
+Упрощенная версия анализатора с надежным решением системы уравнений
 """
 
 import numpy as np
@@ -10,7 +9,6 @@ from typing import Dict, Tuple, Optional
 import os
 from datetime import datetime
 import warnings
-from scipy.optimize import least_squares
 
 warnings.filterwarnings('ignore')
 
@@ -21,8 +19,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class CorrectDataLoader:
-    """Правильный загрузчик данных"""
+class SimpleDataLoader:
+    """Упрощенный загрузчик данных"""
     
     def __init__(self, data_dir: str = "данные"):
         self.data_dir = data_dir
@@ -112,8 +110,8 @@ class CorrectDataLoader:
             logger.error(f"Ошибка при загрузке txt данных: {e}")
             raise
 
-class CorrectEquationSolver:
-    """Правильный решатель системы уравнений"""
+class SimpleEquationSolver:
+    """Упрощенный решатель системы уравнений"""
     
     def __init__(self, num_groups: int = 8):
         self.num_groups = num_groups
@@ -127,12 +125,10 @@ class CorrectEquationSolver:
         # Времена облучения (в секундах)
         self.t_irr_long = 120.0  # длинное облучение
         self.t_irr_short = 20.0  # короткое облучение
-        self.t_decay = 0.0  # время распада
-        self.delta_t = 1.0  # интервал сбора
         
-    def create_sensitivity_matrix(self, num_measurements: int, irradiation_type: str = 'long') -> np.ndarray:
+    def create_simple_matrix(self, num_measurements: int, irradiation_type: str = 'long') -> np.ndarray:
         """
-        Создание матрицы чувствительности A^l_ij на основе физической модели
+        Создание простой матрицы чувствительности на основе физических принципов
         
         Args:
             num_measurements: количество измерений
@@ -147,7 +143,7 @@ class CorrectEquationSolver:
         # Время облучения
         t_irr = self.t_irr_long if irradiation_type == 'long' else self.t_irr_short
         
-        # Создаем матрицу чувствительности на основе физических принципов
+        # Создаем матрицу чувствительности
         A = np.zeros((num_measurements, self.num_groups))
         
         for i in range(num_measurements):
@@ -164,51 +160,31 @@ class CorrectEquationSolver:
                 # Фактор облучения
                 irradiation_factor = 1 - np.exp(-lambda_i * t_irr)
                 
-                # Фактор распада
-                decay_factor = np.exp(-lambda_i * self.t_decay)
+                # Фактор распада (время после облучения)
+                decay_factor = np.exp(-lambda_i * 0.0)  # предполагаем t_decay = 0
                 
-                # Фактор сбора
-                collection_factor = 1 - np.exp(-lambda_i * self.delta_t)
+                # Фактор сбора (интервал сбора)
+                collection_factor = 1 - np.exp(-lambda_i * 1.0)  # предполагаем Δt = 1 с
                 
-                # Фактор времени (T_i из уравнений)
-                T_factor = self._calculate_T_factor(lambda_i, t_meas)
+                # Простая модель чувствительности
+                sensitivity = a_i * irradiation_factor * decay_factor * collection_factor
                 
-                # Общий коэффициент чувствительности
-                sensitivity = a_i * irradiation_factor * decay_factor * collection_factor * T_factor
+                # Добавляем временную зависимость
+                time_factor = np.exp(-lambda_i * t_meas)
+                sensitivity *= time_factor
                 
                 A[i, j] = sensitivity
         
-        # Добавляем регуляризацию для численной стабильности
-        # Добавляем небольшую диагональную матрицу к квадратной части
-        if num_measurements >= self.num_groups:
-            regularization = 1e-6 * np.eye(self.num_groups)
-            A[:self.num_groups, :] = A[:self.num_groups, :] + regularization
-        else:
-            # Если измерений меньше групп, добавляем регуляризацию к доступным строкам
-            for i in range(min(num_measurements, self.num_groups)):
-                A[i, i] += 1e-6
+        # Нормализуем матрицу для численной стабильности
+        max_val = np.max(np.abs(A))
+        if max_val > 0:
+            A = A / max_val
         
         return A
     
-    def _calculate_T_factor(self, lambda_i: float, t_meas: float) -> float:
+    def solve_equations_simple(self, measurements: np.ndarray, irradiation_type: str = 'long') -> Tuple[np.ndarray, np.ndarray]:
         """
-        Вычисление фактора T_i из уравнений
-        T_i = [M / (1 - e^(-λ_i T)) - e^(-λ_i T) (1 - e^(-M λ_i T)) / (1 - e^(-λ_i T))^2]
-        """
-        M = 1.0  # количество циклов
-        T = t_meas  # период измерения
-        
-        if lambda_i * T > 0:
-            exp_term = np.exp(-lambda_i * T)
-            T_factor = M / (1 - exp_term) - exp_term * (1 - np.exp(-M * lambda_i * T)) / (1 - exp_term)**2
-        else:
-            T_factor = 1.0
-        
-        return T_factor
-    
-    def solve_equations(self, measurements: np.ndarray, irradiation_type: str = 'long') -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Решение системы уравнений N^l_i(E_n) = Σ A^l_ij · x_j(E_n)
+        Простое решение системы уравнений N^l_i(E_n) = Σ A^l_ij · x_j(E_n)
         
         Args:
             measurements: измеренные спектры (num_measurements, num_energy_bins)
@@ -220,7 +196,7 @@ class CorrectEquationSolver:
         num_measurements, num_energy_bins = measurements.shape
         
         # Создаем матрицу чувствительности
-        A_matrix = self.create_sensitivity_matrix(num_measurements, irradiation_type)
+        A_matrix = self.create_simple_matrix(num_measurements, irradiation_type)
         
         logger.info(f"Матрица чувствительности {irradiation_type}: {A_matrix.shape}")
         
@@ -232,22 +208,17 @@ class CorrectEquationSolver:
             # Измерения для данного бина
             N_measured = measurements[:, bin_idx]
             
-            # Решаем систему уравнений методом наименьших квадратов с регуляризацией
             try:
-                # Используем псевдообратную матрицу для стабильного решения
-                A_pinv = np.linalg.pinv(A_matrix, rcond=1e-10)
+                # Используем псевдообратную матрицу с большим порогом для стабильности
+                A_pinv = np.linalg.pinv(A_matrix, rcond=1e-6)
                 x_solution = A_pinv @ N_measured
                 
                 # Применяем физические ограничения
                 x_solution = np.maximum(x_solution, 0)
                 
-                # Вычисляем неопределенности на основе псевдообратной матрицы
-                # Ковариационная матрица: cov = A_pinv @ A_pinv.T
-                cov_matrix = A_pinv @ A_pinv.T
-                uncertainty = np.sqrt(np.diag(cov_matrix))
-                
-                # Масштабируем неопределенности
-                uncertainty = uncertainty * np.std(N_measured) / np.mean(np.abs(N_measured))
+                # Простая оценка неопределенности
+                residual = np.linalg.norm(A_matrix @ x_solution - N_measured)
+                uncertainty = np.ones(self.num_groups) * (residual / np.sqrt(num_measurements))
                 
             except Exception as e:
                 logger.warning(f"Ошибка при решении для бина {bin_idx}: {e}")
@@ -260,13 +231,13 @@ class CorrectEquationSolver:
         
         return recovered_spectra, uncertainties
 
-class CorrectSpectrumAnalyzer:
-    """Правильный анализатор спектров ЗН"""
+class SimpleSpectrumAnalyzer:
+    """Упрощенный анализатор спектров ЗН"""
     
     def __init__(self, num_groups: int = 8):
         self.num_groups = num_groups
-        self.data_loader = CorrectDataLoader()
-        self.equation_solver = CorrectEquationSolver(num_groups)
+        self.data_loader = SimpleDataLoader()
+        self.equation_solver = SimpleEquationSolver(num_groups)
     
     def analyze_spectra(self, long_data: np.ndarray, short_data: np.ndarray, 
                        energy_bins: np.ndarray) -> Dict:
@@ -275,11 +246,11 @@ class CorrectSpectrumAnalyzer:
         
         # Решаем систему уравнений для длинного облучения
         logger.info("Решение системы уравнений для длинного облучения...")
-        long_spectra, long_uncertainties = self.equation_solver.solve_equations(long_data, 'long')
+        long_spectra, long_uncertainties = self.equation_solver.solve_equations_simple(long_data, 'long')
         
         # Решаем систему уравнений для короткого облучения
         logger.info("Решение системы уравнений для короткого облучения...")
-        short_spectra, short_uncertainties = self.equation_solver.solve_equations(short_data, 'short')
+        short_spectra, short_uncertainties = self.equation_solver.solve_equations_simple(short_data, 'short')
         
         # Применяем физические ограничения и нормировку
         long_spectra_norm = self._apply_physical_constraints(long_spectra)
@@ -310,7 +281,7 @@ class CorrectSpectrumAnalyzer:
             
             # Применяем физические константы для масштабирования
             abundance = self.data_loader.group_constants['relative_abundances'][group]
-            scaled_spectrum = group_spectrum * abundance * 1000  # Масштабируем для удобства
+            scaled_spectrum = group_spectrum * abundance * 100  # Масштабируем для удобства
             
             constrained[:, group] = scaled_spectrum
         
@@ -379,7 +350,7 @@ class CorrectSpectrumAnalyzer:
         """Сохранение результатов в Excel"""
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"results/correct_equations_{timestamp}.xlsx"
+            filename = f"results/simple_equations_{timestamp}.xlsx"
         
         os.makedirs('results', exist_ok=True)
         
@@ -491,7 +462,7 @@ class CorrectSpectrumAnalyzer:
     def print_summary(self, results: Dict):
         """Вывод краткого отчета"""
         print("\n" + "="*80)
-        print("ОТЧЕТ О РЕЗУЛЬТАТАХ АНАЛИЗА СПЕКТРОВ ЗН (ПРАВИЛЬНЫЕ УРАВНЕНИЯ)")
+        print("ОТЧЕТ О РЕЗУЛЬТАТАХ АНАЛИЗА СПЕКТРОВ ЗН (УПРОЩЕННЫЕ УРАВНЕНИЯ)")
         print("="*80)
         
         # Параметры длинного облучения
@@ -521,7 +492,7 @@ def main():
     try:
         # Инициализация анализатора
         num_groups = 8
-        analyzer = CorrectSpectrumAnalyzer(num_groups)
+        analyzer = SimpleSpectrumAnalyzer(num_groups)
         
         # Загрузка данных измерений
         logger.info("Загрузка данных измерений...")
