@@ -1,6 +1,6 @@
 """
 Финальная версия анализатора спектров запаздывающих нейтронов
-Правильная нормализация и форма спектров
+Решение системы линейных уравнений: N^l_i(E_n) = Σ A^l_ij · x_j(E_n)
 """
 
 import numpy as np
@@ -111,149 +111,160 @@ class FinalDataLoader:
             logger.error(f"Ошибка при загрузке txt данных: {e}")
             raise
 
-class FinalKalmanFilter:
-    """Финальный фильтр Калмана с правильной формой спектров"""
+class FinalEquationSolver:
+    """Решатель системы линейных уравнений для спектров ЗН"""
     
     def __init__(self, num_groups: int = 8):
         self.num_groups = num_groups
         
-        # Состояние фильтра (интенсивности групп)
-        self.x = np.zeros(num_groups)
+        # Физические константы
+        self.abundances = np.array([0.038, 0.213, 0.188, 0.407, 0.128, 0.069, 0.014, 0.001])
+        self.half_lives = np.array([55.6, 22.7, 6.22, 2.30, 0.610, 0.230, 0.052, 0.017])
+        self.decay_constants = np.log(2) / self.half_lives
         
-        # Ковариационная матрица состояния
-        self.P = np.eye(num_groups) * 10  # Уменьшаем начальную неопределенность
-        
-        # Матрица перехода состояния (F)
-        self.F = np.eye(num_groups)
-        
-        # Ковариационная матрица процесса (Q)
-        self.Q = np.eye(num_groups) * 0.001  # Уменьшаем шум процесса
-        
-        # Ковариационная матрица измерений (R)
-        self.R = np.eye(1) * 0.1  # Уменьшаем шум измерений
+        # Параметры облучения
+        self.t_irr_long = 120.0  # секунды
+        self.t_irr_short = 20.0  # секунды
+        self.t_decay = 0.0  # время распада после облучения
+        self.delta_t = 1.0  # время измерения
+        self.T = 100.0  # период измерения
+        self.M = 1  # количество циклов измерения
     
-    def create_physical_sensitivity_matrix(self, num_measurements: int) -> np.ndarray:
+    def create_sensitivity_matrix(self, t_irr: float, num_measurements: int) -> np.ndarray:
         """
-        Создание физически корректной матрицы чувствительности
-        Основанной на реальных физических принципах
+        Создание матрицы чувствительности A^l_ij согласно уравнению:
+        A^l_ij = (a_i / λ_i) * (1 - e^(-λ_i * t_irr)) * (e^(-λ_i * t_decay)) * (1 - e^(-λ_i * delta_t)) * T_i
+        где T_i = [M / (1 - e^(-λ_i * T)) - e^(-λ_i * T) * (1 - e^(-M * λ_i * T)) / (1 - e^(-λ_i * T))^2]
         """
-        H = np.zeros((num_measurements, self.num_groups))
-        
-        # Периоды полураспада групп (в секундах)
-        half_lives = [55.6, 22.7, 6.22, 2.30, 0.610, 0.230, 0.052, 0.017]
-        
-        # Относительные распространенности групп
-        abundances = [0.038, 0.213, 0.188, 0.407, 0.128, 0.069, 0.014, 0.001]
+        A = np.zeros((num_measurements, self.num_groups))
         
         for i in range(num_measurements):
             for j in range(self.num_groups):
-                # Время измерения (нормализованное)
-                time_factor = i / (num_measurements - 1)
+                # Время измерения (нормализованное от 0 до T)
+                t_meas = i * self.T / (num_measurements - 1)
                 
-                # Физическая модель: чувствительность зависит от времени и периода полураспада
-                # Долгоживущие группы более чувствительны к поздним измерениям
-                decay_constant = np.log(2) / half_lives[j]
-                sensitivity = abundances[j] * np.exp(-decay_constant * time_factor * 100)  # Масштабируем время
+                # Расчет T_i фактора
+                lambda_i = self.decay_constants[j]
+                T_factor = self._calculate_T_factor(lambda_i, t_meas)
                 
-                # Добавляем случайную компоненту для реалистичности
-                noise = np.random.normal(0, 0.1)
-                H[i, j] = max(0.01, sensitivity + noise)
-            
-            # Нормализуем строку
-            row_sum = np.sum(H[i, :])
-            if row_sum > 0:
-                H[i, :] = H[i, :] / row_sum
+                # Расчет коэффициента A^l_ij
+                a_i = self.abundances[j]
+                lambda_i = self.decay_constants[j]
+                
+                # Основная формула
+                A[i, j] = (a_i / lambda_i) * \
+                         (1 - np.exp(-lambda_i * t_irr)) * \
+                         np.exp(-lambda_i * self.t_decay) * \
+                         (1 - np.exp(-lambda_i * self.delta_t)) * \
+                         T_factor
+                
+                # Добавляем базовую чувствительность для предотвращения нулевых значений
+                A[i, j] += 0.01 * self.abundances[j]
         
-        return H
+        # Нормализация всей матрицы для численной стабильности
+        max_val = np.max(np.abs(A))
+        if max_val > 0:
+            A = A / max_val
+        
+        return A
     
-    def predict(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Этап предсказания"""
-        x_prior = self.F @ self.x
-        P_prior = self.F @ self.P @ self.F.T + self.Q
-        return x_prior, P_prior
+    def _calculate_T_factor(self, lambda_i: float, t_meas: float) -> float:
+        """
+        Расчет T_i фактора:
+        T_i = [M / (1 - e^(-λ_i * T)) - e^(-λ_i * T) * (1 - e^(-M * λ_i * T)) / (1 - e^(-λ_i * T))^2]
+        """
+        if lambda_i * self.T < 1e-10:  # Избегаем деления на ноль
+            return self.M
+        
+        exp_lambda_T = np.exp(-lambda_i * self.T)
+        exp_M_lambda_T = np.exp(-self.M * lambda_i * self.T)
+        
+        denominator = 1 - exp_lambda_T
+        
+        if abs(denominator) < 1e-10:
+            return self.M
+        
+        T_factor = (self.M / denominator) - \
+                   (exp_lambda_T * (1 - exp_M_lambda_T) / (denominator ** 2))
+        
+        return T_factor
     
-    def update(self, measurement: float, H_row: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Этап обновления с физическими ограничениями"""
-        x_prior, P_prior = self.predict()
-        
-        H = H_row.reshape(1, -1)
-        
-        # Вычисление коэффициента усиления Калмана
-        S = H @ P_prior @ H.T + self.R
-        K = P_prior @ H.T @ np.linalg.inv(S)
-        
-        # Обновление состояния
-        y = measurement - H @ x_prior
-        x_posterior = x_prior + K.flatten() * y
-        
-        # ФИЗИЧЕСКИЕ ОГРАНИЧЕНИЯ: спектры не могут быть отрицательными
-        x_posterior = np.maximum(x_posterior, 0)
-        
-        # Обновление ковариации
-        I = np.eye(self.num_groups)
-        P_posterior = (I - K @ H) @ P_prior
-        
-        # Обновление состояния фильтра
-        self.x = x_posterior
-        self.P = P_posterior
-        
-        return x_posterior, P_posterior
-    
-    def run_filter(self, measurements: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Запуск фильтра Калмана для всех энергетических бинов"""
+    def solve_equations(self, measurements: np.ndarray, t_irr: float) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Решение системы уравнений: N^l_i(E_n) = Σ A^l_ij · x_j(E_n)
+        для каждого энергетического бина E_n
+        """
         num_measurements, num_energy_bins = measurements.shape
         
-        # Создаем физически корректную матрицу чувствительности
-        H_matrix = self.create_physical_sensitivity_matrix(num_measurements)
+        # Создаем матрицу чувствительности
+        A = self.create_sensitivity_matrix(t_irr, num_measurements)
         
         # Массивы для результатов
-        recovered_spectra = np.zeros((num_energy_bins, self.num_groups))
+        group_spectra = np.zeros((num_energy_bins, self.num_groups))
         uncertainties = np.zeros((num_energy_bins, self.num_groups))
         
-        # Обрабатываем каждый энергетический бин
+        # Решаем систему для каждого энергетического бина
         for bin_idx in range(num_energy_bins):
-            # Сброс фильтра для нового бина
-            self.x = np.zeros(self.num_groups)
-            self.P = np.eye(self.num_groups) * 10
+            # Измерения для данного бина
+            b = measurements[:, bin_idx]
             
-            # Обрабатываем все измерения для данного бина
-            for meas_idx in range(num_measurements):
-                measurement = measurements[meas_idx, bin_idx]
-                H_row = H_matrix[meas_idx, :]
+            # Решение системы Ax = b
+            try:
+                # Используем псевдообратную матрицу для стабильности
+                A_pinv = np.linalg.pinv(A, rcond=1e-10)
+                x_solution = A_pinv @ b
                 
-                # Обновление фильтра
-                x_updated, P_updated = self.update(measurement, H_row)
+                # Применяем физические ограничения
+                x_solution = np.maximum(x_solution, 0)  # Неотрицательность
                 
-                # Сохраняем результаты для последнего измерения
-                if meas_idx == num_measurements - 1:
-                    recovered_spectra[bin_idx, :] = x_updated
-                    uncertainties[bin_idx, :] = np.sqrt(np.diag(P_updated))
+                # Обеспечиваем минимальный вклад каждой группы
+                min_contribution = 0.001 * np.max(x_solution)
+                x_solution = np.maximum(x_solution, min_contribution * self.abundances)
+                
+                # Сохраняем результаты
+                group_spectra[bin_idx, :] = x_solution
+                
+                # Расчет неопределенностей (упрощенный)
+                residuals = b - A @ x_solution
+                uncertainty = np.sqrt(np.mean(residuals**2)) * np.ones(self.num_groups)
+                uncertainties[bin_idx, :] = uncertainty
+                
+            except np.linalg.LinAlgError as e:
+                logger.warning(f"Проблема с решением для бина {bin_idx}: {e}")
+                # Используем простое решение в случае ошибки
+                x_solution = np.linalg.lstsq(A, b, rcond=1e-10)[0]
+                x_solution = np.maximum(x_solution, 0)
+                group_spectra[bin_idx, :] = x_solution
+                uncertainties[bin_idx, :] = 0.1 * np.ones(self.num_groups)
         
-        return recovered_spectra, uncertainties
+        return group_spectra, uncertainties
 
 class FinalSpectrumAnalyzer:
-    """Финальный анализатор спектров ЗН"""
+    """Финальный анализатор спектров ЗН с решением системы уравнений"""
     
     def __init__(self, num_groups: int = 8):
         self.num_groups = num_groups
         self.data_loader = FinalDataLoader()
-        self.kalman_filter = FinalKalmanFilter(num_groups)
+        self.equation_solver = FinalEquationSolver(num_groups)
     
     def analyze_spectra(self, long_data: np.ndarray, short_data: np.ndarray, 
                        energy_bins: np.ndarray) -> Dict:
-        """Анализ спектров с использованием фильтра Калмана"""
+        """Анализ спектров с решением системы уравнений"""
         logger.info(f"Запуск анализа для {self.num_groups} групп ЗН...")
         
-        # Анализируем данные длинного облучения
-        logger.info("Анализ данных длинного облучения...")
-        long_spectra, long_uncertainties = self.kalman_filter.run_filter(long_data)
+        # Решение для длинного облучения
+        logger.info("Решение для данных длинного облучения...")
+        long_spectra, long_uncertainties = self.equation_solver.solve_equations(
+            long_data, self.equation_solver.t_irr_long
+        )
         
-        # Анализируем данные короткого облучения
-        logger.info("Анализ данных короткого облучения...")
-        short_spectra, short_uncertainties = self.kalman_filter.run_filter(short_data)
+        # Решение для короткого облучения
+        logger.info("Решение для данных короткого облучения...")
+        short_spectra, short_uncertainties = self.equation_solver.solve_equations(
+            short_data, self.equation_solver.t_irr_short
+        )
         
-        # ПРАВИЛЬНАЯ НОРМАЛИЗАЦИЯ: сохраняем абсолютные значения
-        # НЕ нормализуем к 1, сохраняем реальные интенсивности
+        # Применение физических ограничений
         long_spectra_norm = self._apply_physical_constraints(long_spectra)
         short_spectra_norm = self._apply_physical_constraints(short_spectra)
         
@@ -268,7 +279,7 @@ class FinalSpectrumAnalyzer:
     def _apply_physical_constraints(self, spectra: np.ndarray) -> np.ndarray:
         """
         Применение физических ограничений к спектрам
-        БЕЗ нормализации к 1, сохраняем абсолютные значения
+        Сохраняем абсолютные значения, не нормализуем к 1
         """
         constrained = np.zeros_like(spectra)
         
@@ -283,10 +294,9 @@ class FinalSpectrumAnalyzer:
             # ОГРАНИЧЕНИЕ: спектры не могут быть отрицательными
             group_spectrum = np.maximum(group_spectrum, 0)
             
-            # Применяем физические константы для масштабирования
-            # Используем относительную распространенность группы
+            # Масштабирование с учетом физических констант
             abundance = self.data_loader.group_constants['relative_abundances'][group]
-            scaled_spectrum = group_spectrum * abundance * 1000  # Масштабируем для удобства
+            scaled_spectrum = group_spectrum * abundance * 100  # Абсолютные значения
             
             constrained[:, group] = scaled_spectrum
         
@@ -332,7 +342,7 @@ class FinalSpectrumAnalyzer:
             else:
                 fwhm = 0
             
-            # Общая интенсивность (абсолютная, не нормализованная)
+            # Общая интенсивность (абсолютная)
             total_intensity = np.sum(spectrum)
             total_uncertainty = np.sqrt(np.sum(uncertainty**2))
             
@@ -467,7 +477,7 @@ class FinalSpectrumAnalyzer:
     def print_summary(self, results: Dict):
         """Вывод краткого отчета"""
         print("\n" + "="*80)
-        print("ОТЧЕТ О РЕЗУЛЬТАТАХ АНАЛИЗА СПЕКТРОВ ЗН (ФИНАЛЬНАЯ ВЕРСИЯ)")
+        print("ОТЧЕТ О РЕЗУЛЬТАТАХ АНАЛИЗА СПЕКТРОВ ЗН (СИСТЕМА УРАВНЕНИЙ)")
         print("="*80)
         
         # Параметры длинного облучения
@@ -511,7 +521,7 @@ def main():
         logger.info(f"Данные короткого облучения: {short_data.shape}")
         logger.info(f"Количество групп ЗН: {num_groups}")
         
-        # Анализ с фильтром Калмана
+        # Анализ с решением системы уравнений
         results = analyzer.analyze_spectra(long_data, short_data, energy_bins)
         
         # Сохранение результатов
