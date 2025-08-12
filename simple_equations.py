@@ -175,6 +175,11 @@ class SimpleEquationSolver:
                 
                 A[i, j] = sensitivity
         
+        # Добавляем базовую чувствительность для всех групп
+        # Это гарантирует, что каждая группа будет иметь минимальный вклад
+        for j in range(self.num_groups):
+            A[:, j] += 0.01 * self.abundances[j]
+        
         # Нормализуем матрицу для численной стабильности
         max_val = np.max(np.abs(A))
         if max_val > 0:
@@ -215,6 +220,11 @@ class SimpleEquationSolver:
                 
                 # Применяем физические ограничения
                 x_solution = np.maximum(x_solution, 0)
+                
+                # Обеспечиваем минимальный вклад каждой группы
+                # Каждая группа должна иметь хотя бы минимальный вклад
+                min_contribution = np.mean(N_measured) * 0.001  # 0.1% от среднего
+                x_solution = np.maximum(x_solution, min_contribution * self.abundances)
                 
                 # Простая оценка неопределенности
                 residual = np.linalg.norm(A_matrix @ x_solution - N_measured)
