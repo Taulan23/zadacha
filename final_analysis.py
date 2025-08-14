@@ -130,43 +130,88 @@ class FinalEquationSolver:
         self.T = 100.0  # период измерения
         self.M = 1  # количество циклов измерения
     
-    def create_sensitivity_matrix(self, t_irr: float, num_measurements: int) -> np.ndarray:
+    def create_sensitivity_matrix(self, t_irr: float, num_measurements: int) -> Tuple[np.ndarray, Dict]:
         """
         Создание матрицы чувствительности A^l_ij согласно уравнению:
         A^l_ij = (a_i / λ_i) * (1 - e^(-λ_i * t_irr)) * (e^(-λ_i * t_decay)) * (1 - e^(-λ_i * delta_t)) * T_i
         где T_i = [M / (1 - e^(-λ_i * T)) - e^(-λ_i * T) * (1 - e^(-M * λ_i * T)) / (1 - e^(-λ_i * T))^2]
+        
+        Возвращает:
+            Матрицу A и детальную информацию о всех коэффициентах
         """
         A = np.zeros((num_measurements, self.num_groups))
+        coefficients_info = {
+            'measurement_times': [],
+            'group_coefficients': {},
+            'matrix_normalization': 0.0
+        }
         
+        # Расчет времен измерения
+        measurement_times = []
         for i in range(num_measurements):
-            for j in range(self.num_groups):
-                # Время измерения (нормализованное от 0 до T)
-                t_meas = i * self.T / (num_measurements - 1)
+            t_meas = i * self.T / (num_measurements - 1)
+            measurement_times.append(t_meas)
+        coefficients_info['measurement_times'] = measurement_times
+        
+        # Расчет коэффициентов для каждой группы
+        for j in range(self.num_groups):
+            lambda_i = self.decay_constants[j]
+            a_i = self.abundances[j]
+            half_life = self.half_lives[j]
+            
+            group_info = {
+                'group_number': j + 1,
+                'abundance': a_i,
+                'half_life': half_life,
+                'decay_constant': lambda_i,
+                'measurements': []
+            }
+            
+            for i in range(num_measurements):
+                t_meas = measurement_times[i]
                 
                 # Расчет T_i фактора
-                lambda_i = self.decay_constants[j]
                 T_factor = self._calculate_T_factor(lambda_i, t_meas)
                 
-                # Расчет коэффициента A^l_ij
-                a_i = self.abundances[j]
-                lambda_i = self.decay_constants[j]
+                # Компоненты формулы
+                abundance_factor = a_i / lambda_i
+                irradiation_factor = 1 - np.exp(-lambda_i * t_irr)
+                decay_factor = np.exp(-lambda_i * self.t_decay)
+                measurement_factor = 1 - np.exp(-lambda_i * self.delta_t)
                 
                 # Основная формула
-                A[i, j] = (a_i / lambda_i) * \
-                         (1 - np.exp(-lambda_i * t_irr)) * \
-                         np.exp(-lambda_i * self.t_decay) * \
-                         (1 - np.exp(-lambda_i * self.delta_t)) * \
-                         T_factor
+                A_component = abundance_factor * irradiation_factor * decay_factor * measurement_factor * T_factor
                 
-                # Добавляем базовую чувствительность для предотвращения нулевых значений
-                A[i, j] += 0.01 * self.abundances[j]
+                # Базовая чувствительность
+                base_sensitivity = 0.01 * a_i
+                
+                # Общий коэффициент
+                A[i, j] = A_component + base_sensitivity
+                
+                # Сохранение детальной информации
+                measurement_info = {
+                    'measurement_index': i,
+                    'time': t_meas,
+                    'abundance_factor': abundance_factor,
+                    'irradiation_factor': irradiation_factor,
+                    'decay_factor': decay_factor,
+                    'measurement_factor': measurement_factor,
+                    'T_factor': T_factor,
+                    'A_component': A_component,
+                    'base_sensitivity': base_sensitivity,
+                    'final_coefficient': A[i, j]
+                }
+                group_info['measurements'].append(measurement_info)
+            
+            coefficients_info['group_coefficients'][f'group_{j+1}'] = group_info
         
         # Нормализация всей матрицы для численной стабильности
         max_val = np.max(np.abs(A))
         if max_val > 0:
             A = A / max_val
+            coefficients_info['matrix_normalization'] = max_val
         
-        return A
+        return A, coefficients_info
     
     def _calculate_T_factor(self, lambda_i: float, t_meas: float) -> float:
         """
@@ -189,15 +234,27 @@ class FinalEquationSolver:
         
         return T_factor
     
-    def solve_equations(self, measurements: np.ndarray, t_irr: float) -> Tuple[np.ndarray, np.ndarray]:
+    def solve_equations(self, measurements: np.ndarray, t_irr: float) -> Tuple[np.ndarray, np.ndarray, Dict]:
         """
         Решение системы уравнений: N^l_i(E_n) = Σ A^l_ij · x_j(E_n)
         для каждого энергетического бина E_n
+        
+        Возвращает:
+            group_spectra, uncertainties, coefficients_info
         """
         num_measurements, num_energy_bins = measurements.shape
         
-        # Создаем матрицу чувствительности
-        A = self.create_sensitivity_matrix(t_irr, num_measurements)
+        # Создаем матрицу чувствительности с детальной информацией
+        A, coefficients_info = self.create_sensitivity_matrix(t_irr, num_measurements)
+        
+        # Добавляем параметры облучения к информации
+        coefficients_info['irradiation_time'] = t_irr
+        coefficients_info['t_decay'] = self.t_decay
+        coefficients_info['delta_t'] = self.delta_t
+        coefficients_info['T'] = self.T
+        coefficients_info['M'] = self.M
+        coefficients_info['num_measurements'] = num_measurements
+        coefficients_info['num_energy_bins'] = num_energy_bins
         
         # Массивы для результатов
         group_spectra = np.zeros((num_energy_bins, self.num_groups))
@@ -237,7 +294,7 @@ class FinalEquationSolver:
                 group_spectra[bin_idx, :] = x_solution
                 uncertainties[bin_idx, :] = 0.1 * np.ones(self.num_groups)
         
-        return group_spectra, uncertainties
+        return group_spectra, uncertainties, coefficients_info
 
 class FinalSpectrumAnalyzer:
     """Финальный анализатор спектров ЗН с решением системы уравнений"""
@@ -254,13 +311,13 @@ class FinalSpectrumAnalyzer:
         
         # Решение для длинного облучения
         logger.info("Решение для данных длинного облучения...")
-        long_spectra, long_uncertainties = self.equation_solver.solve_equations(
+        long_spectra, long_uncertainties, long_coefficients = self.equation_solver.solve_equations(
             long_data, self.equation_solver.t_irr_long
         )
         
         # Решение для короткого облучения
         logger.info("Решение для данных короткого облучения...")
-        short_spectra, short_uncertainties = self.equation_solver.solve_equations(
+        short_spectra, short_uncertainties, short_coefficients = self.equation_solver.solve_equations(
             short_data, self.equation_solver.t_irr_short
         )
         
@@ -273,6 +330,8 @@ class FinalSpectrumAnalyzer:
             'short_spectra': short_spectra_norm,
             'long_uncertainties': long_uncertainties,
             'short_uncertainties': short_uncertainties,
+            'long_coefficients': long_coefficients,
+            'short_coefficients': short_coefficients,
             'energy_bins': energy_bins
         }
     
@@ -470,15 +529,142 @@ class FinalSpectrumAnalyzer:
                 })
             
             pd.DataFrame(constants_data).to_excel(writer, sheet_name='Физич_константы', index=False)
+            
+            # Лист 9: Коэффициенты матрицы чувствительности (длинное облучение)
+            self._save_coefficients_details(writer, results['long_coefficients'], 'Коэффициенты_длинное')
+            
+            # Лист 10: Коэффициенты матрицы чувствительности (короткое облучение)
+            self._save_coefficients_details(writer, results['short_coefficients'], 'Коэффициенты_короткое')
+            
+            # Лист 11: Сводка всех коэффициентов (длинное облучение)
+            self._save_coefficients_summary(writer, results['long_coefficients'], 'Сводка_коэф_длинное')
+            
+            # Лист 12: Сводка всех коэффициентов (короткое облучение)
+            self._save_coefficients_summary(writer, results['short_coefficients'], 'Сводка_коэф_короткое')
         
         logger.info(f"Результаты сохранены в файл: {filename}")
         return filename
+    
+    def _save_coefficients_details(self, writer, coefficients_info: Dict, sheet_name: str):
+        """Сохранение детальной информации о коэффициентах матрицы"""
+        details_data = []
+        
+        # Добавляем общую информацию о параметрах
+        details_data.append({
+            'Группа': 'Параметры облучения',
+            'Номер измерения': '',
+            'Время (с)': '',
+            'Время облучения (с)': coefficients_info['irradiation_time'],
+            'Время распада (с)': coefficients_info['t_decay'],
+            'Время измерения (с)': coefficients_info['delta_t'],
+            'Период T (с)': coefficients_info['T'],
+            'Количество циклов M': coefficients_info['M'],
+            'Нормализация матрицы': coefficients_info['matrix_normalization'],
+            'Относительная распространенность': '',
+            'Период полураспада (с)': '',
+            'Константа распада (1/с)': '',
+            'Фактор распространенности': '',
+            'Фактор облучения': '',
+            'Фактор распада': '',
+            'Фактор измерения': '',
+            'T-фактор': '',
+            'A-компонента': '',
+            'Базовая чувствительность': '',
+            'Финальный коэффициент': ''
+        })
+        
+        details_data.append({})  # Пустая строка для разделения
+        
+        # Детальная информация для каждой группы
+        for group_key, group_info in coefficients_info['group_coefficients'].items():
+            group_num = group_info['group_number']
+            
+            # Заголовок группы
+            details_data.append({
+                'Группа': f"Группа {group_num}",
+                'Номер измерения': '',
+                'Время (с)': '',
+                'Время облучения (с)': '',
+                'Время распада (с)': '',
+                'Время измерения (с)': '',
+                'Период T (с)': '',
+                'Количество циклов M': '',
+                'Нормализация матрицы': '',
+                'Относительная распространенность': group_info['abundance'],
+                'Период полураспада (с)': group_info['half_life'],
+                'Константа распада (1/с)': group_info['decay_constant'],
+                'Фактор распространенности': '',
+                'Фактор облучения': '',
+                'Фактор распада': '',
+                'Фактор измерения': '',
+                'T-фактор': '',
+                'A-компонента': '',
+                'Базовая чувствительность': '',
+                'Финальный коэффициент': ''
+            })
+            
+            # Данные для каждого измерения
+            for meas in group_info['measurements']:
+                details_data.append({
+                    'Группа': '',
+                    'Номер измерения': meas['measurement_index'],
+                    'Время (с)': f"{meas['time']:.3f}",
+                    'Время облучения (с)': '',
+                    'Время распада (с)': '',
+                    'Время измерения (с)': '',
+                    'Период T (с)': '',
+                    'Количество циклов M': '',
+                    'Нормализация матрицы': '',
+                    'Относительная распространенность': '',
+                    'Период полураспада (с)': '',
+                    'Константа распада (1/с)': '',
+                    'Фактор распространенности': f"{meas['abundance_factor']:.6e}",
+                    'Фактор облучения': f"{meas['irradiation_factor']:.6f}",
+                    'Фактор распада': f"{meas['decay_factor']:.6f}",
+                    'Фактор измерения': f"{meas['measurement_factor']:.6f}",
+                    'T-фактор': f"{meas['T_factor']:.6e}",
+                    'A-компонента': f"{meas['A_component']:.6e}",
+                    'Базовая чувствительность': f"{meas['base_sensitivity']:.6e}",
+                    'Финальный коэффициент': f"{meas['final_coefficient']:.6e}"
+                })
+            
+            details_data.append({})  # Пустая строка между группами
+        
+        pd.DataFrame(details_data).to_excel(writer, sheet_name=sheet_name, index=False)
+    
+    def _save_coefficients_summary(self, writer, coefficients_info: Dict, sheet_name: str):
+        """Сохранение сводной матрицы коэффициентов"""
+        # Создаем матрицу коэффициентов
+        num_measurements = len(coefficients_info['measurement_times'])
+        num_groups = len(coefficients_info['group_coefficients'])
+        
+        matrix_data = []
+        
+        # Заголовок с временами измерения
+        header_row = ['Группа\\Время (с)'] + [f"{t:.3f}" for t in coefficients_info['measurement_times']]
+        matrix_data.append(dict(zip(range(len(header_row)), header_row)))
+        
+        # Данные для каждой группы
+        for group_key in sorted(coefficients_info['group_coefficients'].keys()):
+            group_info = coefficients_info['group_coefficients'][group_key]
+            group_num = group_info['group_number']
+            
+            row = [f"Группа {group_num}"]
+            for meas in group_info['measurements']:
+                row.append(f"{meas['final_coefficient']:.6e}")
+            
+            matrix_data.append(dict(zip(range(len(row)), row)))
+        
+        pd.DataFrame(matrix_data).to_excel(writer, sheet_name=sheet_name, index=False, header=False)
     
     def print_summary(self, results: Dict):
         """Вывод краткого отчета"""
         print("\n" + "="*80)
         print("ОТЧЕТ О РЕЗУЛЬТАТАХ АНАЛИЗА СПЕКТРОВ ЗН (СИСТЕМА УРАВНЕНИЙ)")
         print("="*80)
+        
+        # Информация о коэффициентах системы уравнений
+        self._print_coefficients_info(results)
         
         # Параметры длинного облучения
         long_params = self.calculate_spectral_parameters(
@@ -501,6 +687,50 @@ class FinalSpectrumAnalyzer:
         print("="*80)
         print("АНАЛИЗ ЗАВЕРШЕН УСПЕШНО!")
         print("="*80)
+    
+    def _print_coefficients_info(self, results: Dict):
+        """Вывод информации о коэффициентах системы уравнений"""
+        print("\nИНФОРМАЦИЯ О КОЭФФИЦИЕНТАХ СИСТЕМЫ УРАВНЕНИЙ:")
+        print("="*60)
+        
+        # Информация о длинном облучении
+        long_coeff = results['long_coefficients']
+        print(f"\nДЛИННОЕ ОБЛУЧЕНИЕ:")
+        print(f"  Время облучения: {long_coeff['irradiation_time']:.1f} с")
+        print(f"  Время распада: {long_coeff['t_decay']:.1f} с")
+        print(f"  Время измерения: {long_coeff['delta_t']:.1f} с")
+        print(f"  Период T: {long_coeff['T']:.1f} с")
+        print(f"  Количество циклов M: {long_coeff['M']}")
+        print(f"  Количество измерений: {long_coeff['num_measurements']}")
+        print(f"  Нормализация матрицы: {long_coeff['matrix_normalization']:.6e}")
+        
+        # Краткая информация о коэффициентах групп
+        print(f"\n  КОЭФФИЦИЕНТЫ ПО ГРУППАМ (образец):")
+        for i, (group_key, group_info) in enumerate(long_coeff['group_coefficients'].items()):
+            if i < 3:  # Показываем только первые 3 группы для краткости
+                group_num = group_info['group_number']
+                first_meas = group_info['measurements'][0]
+                last_meas = group_info['measurements'][-1]
+                print(f"    Группа {group_num}:")
+                print(f"      Распространенность: {group_info['abundance']:.3f}")
+                print(f"      Период полураспада: {group_info['half_life']:.2f} с")
+                print(f"      Первый коэффициент A[0,{group_num-1}]: {first_meas['final_coefficient']:.6e}")
+                print(f"      Последний коэффициент A[{long_coeff['num_measurements']-1},{group_num-1}]: {last_meas['final_coefficient']:.6e}")
+        
+        if len(long_coeff['group_coefficients']) > 3:
+            print(f"    ... и ещё {len(long_coeff['group_coefficients']) - 3} групп")
+        
+        # Информация о коротком облучении
+        short_coeff = results['short_coefficients']
+        print(f"\nКОРОТКОЕ ОБЛУЧЕНИЕ:")
+        print(f"  Время облучения: {short_coeff['irradiation_time']:.1f} с")
+        print(f"  Количество измерений: {short_coeff['num_measurements']}")
+        print(f"  Нормализация матрицы: {short_coeff['matrix_normalization']:.6e}")
+        
+        print(f"\nПОДРОБНАЯ ИНФОРМАЦИЯ О ВСЕХ КОЭФФИЦИЕНТАХ СОХРАНЕНА В EXCEL:")
+        print(f"  - Листы 'Коэффициенты_длинное' и 'Коэффициенты_короткое'")
+        print(f"  - Листы 'Сводка_коэф_длинное' и 'Сводка_коэф_короткое'")
+        print("="*60)
 
 def main():
     """Главная функция"""
