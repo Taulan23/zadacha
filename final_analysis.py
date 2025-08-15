@@ -174,29 +174,16 @@ class FinalEquationSolver:
                 # Расчет T_i фактора
                 T_factor = self._calculate_T_factor(lambda_i, t_meas)
                 
-                # Компоненты формулы
+                # Компоненты формулы согласно правильной физике эксперимента
                 abundance_factor = a_i / lambda_i
                 
-                # Фактор облучения зависит от времени измерения
-                # Если измерение происходит во время облучения, то фактор меньше
-                # Если измерение происходит после облучения, то фактор полный
-                if t_meas <= t_irr:
-                    # Измерение во время облучения
-                    irradiation_factor = 1 - np.exp(-lambda_i * t_meas)
-                else:
-                    # Измерение после облучения
-                    # Для групп с очень коротким периодом полураспада используем специальную физику
-                    if lambda_i * t_irr > 10:  # Очень короткий период полураспада
-                        # Эти группы быстро затухают после облучения
-                        irradiation_factor = np.exp(-lambda_i * (t_meas - t_irr)) * 0.1
-                    elif lambda_i * t_irr > 5:  # Короткий период полураспада
-                        # Полное насыщение, но затухание после облучения
-                        irradiation_factor = np.exp(-lambda_i * (t_meas - t_irr))
-                    else:
-                        # Обычный фактор облучения
-                        irradiation_factor = 1 - np.exp(-lambda_i * t_irr)
+                # Фактор облучения - всегда полное облучение
+                irradiation_factor = 1 - np.exp(-lambda_i * t_irr)
                 
+                # Фактор распада после облучения до начала измерения (t_decay = 0.12с)
                 decay_factor = np.exp(-lambda_i * self.t_decay)
+                
+                # Фактор измерения на интервале (delta_t = 0.88с)
                 measurement_factor = 1 - np.exp(-lambda_i * self.delta_t)
                 
                 # Основная формула
