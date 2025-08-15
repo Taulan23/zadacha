@@ -10,6 +10,7 @@ from typing import Dict, Tuple, Optional
 import os
 from datetime import datetime
 import warnings
+from constants import GROUP_CONSTANTS, EXPERIMENT_PARAMS, NUMERICAL_PARAMS, T_FACTOR_PARAMS
 
 warnings.filterwarnings('ignore')
 
@@ -26,11 +27,8 @@ class FinalDataLoader:
     def __init__(self, data_dir: str = "данные"):
         self.data_dir = data_dir
         
-        # Физические константы для 8-групповой модели 235U (из литературы)
-        self.group_constants = {
-            'relative_abundances': [0.038, 0.213, 0.188, 0.407, 0.128, 0.069, 0.014, 0.001],
-            'half_lives': [55.6, 22.7, 6.22, 2.30, 0.610, 0.230, 0.052, 0.017]  # секунды
-        }
+        # Физические константы из файла constants.py
+        self.group_constants = GROUP_CONSTANTS
     
     def load_measurement_data(self, filename: str = "DN Integral spectra -short and long irradiation.xlsx") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Загрузка только данных измерений"""
@@ -114,21 +112,24 @@ class FinalDataLoader:
 class FinalEquationSolver:
     """Решатель системы линейных уравнений для спектров ЗН"""
     
-    def __init__(self, num_groups: int = 8):
+    def __init__(self, num_groups: int = None):
+        # Используем количество групп из констант, если не указано
+        if num_groups is None:
+            num_groups = EXPERIMENT_PARAMS['num_groups']
         self.num_groups = num_groups
         
-        # Физические константы
-        self.abundances = np.array([0.038, 0.213, 0.188, 0.407, 0.128, 0.069, 0.014, 0.001])
-        self.half_lives = np.array([55.6, 22.7, 6.22, 2.30, 0.610, 0.230, 0.052, 0.017])
+        # Физические константы из файла
+        self.abundances = np.array(GROUP_CONSTANTS['relative_abundances'][:num_groups])
+        self.half_lives = np.array(GROUP_CONSTANTS['half_lives'][:num_groups])
         self.decay_constants = np.log(2) / self.half_lives
         
-        # Параметры облучения
-        self.t_irr_long = 120.0  # секунды
-        self.t_irr_short = 20.0  # секунды
-        self.t_decay = 0.0  # время распада после облучения
-        self.delta_t = 1.0  # время измерения
-        self.T = 100.0  # период измерения
-        self.M = 1  # количество циклов измерения
+        # Параметры эксперимента из файла
+        self.t_irr_long = EXPERIMENT_PARAMS['irradiation_times']['long']
+        self.t_irr_short = EXPERIMENT_PARAMS['irradiation_times']['short']
+        self.t_decay = EXPERIMENT_PARAMS['decay_time']
+        self.delta_t = EXPERIMENT_PARAMS['measurement_time']
+        self.T = EXPERIMENT_PARAMS['measurement_period']
+        self.M = EXPERIMENT_PARAMS['num_cycles']
     
     def create_sensitivity_matrix(self, t_irr: float, num_measurements: int) -> Tuple[np.ndarray, Dict]:
         """
@@ -183,7 +184,7 @@ class FinalEquationSolver:
                 A_component = abundance_factor * irradiation_factor * decay_factor * measurement_factor * T_factor
                 
                 # Базовая чувствительность
-                base_sensitivity = 0.01 * a_i
+                base_sensitivity = NUMERICAL_PARAMS['base_sensitivity_factor'] * a_i
                 
                 # Общий коэффициент
                 A[i, j] = A_component + base_sensitivity
@@ -215,22 +216,33 @@ class FinalEquationSolver:
     
     def _calculate_T_factor(self, lambda_i: float, t_meas: float) -> float:
         """
-        Расчет T_i фактора:
-        T_i = [M / (1 - e^(-λ_i * T)) - e^(-λ_i * T) * (1 - e^(-M * λ_i * T)) / (1 - e^(-λ_i * T))^2]
+        Расчет T_i фактора с учетом времени измерения:
+        T_i = e^(-λ_i * t_meas) * [M / (1 - e^(-λ_i * T)) - e^(-λ_i * T) * (1 - e^(-M * λ_i * T)) / (1 - e^(-λ_i * T))^2]
+        
+        Или упрощенная формула для M=1:
+        T_i = e^(-λ_i * t_meas)
         """
-        if lambda_i * self.T < 1e-10:  # Избегаем деления на ноль
-            return self.M
+        if T_FACTOR_PARAMS['use_simplified_formula'] and self.M == 1:
+            # Упрощенная формула для M=1
+            return np.exp(-lambda_i * t_meas)
+        
+        # Полная формула
+        if lambda_i * self.T < NUMERICAL_PARAMS['zero_threshold']:
+            return self.M * np.exp(-lambda_i * t_meas)
         
         exp_lambda_T = np.exp(-lambda_i * self.T)
         exp_M_lambda_T = np.exp(-self.M * lambda_i * self.T)
         
         denominator = 1 - exp_lambda_T
         
-        if abs(denominator) < 1e-10:
-            return self.M
+        if abs(denominator) < NUMERICAL_PARAMS['zero_threshold']:
+            return self.M * np.exp(-lambda_i * t_meas)
         
-        T_factor = (self.M / denominator) - \
-                   (exp_lambda_T * (1 - exp_M_lambda_T) / (denominator ** 2))
+        T_factor_base = (self.M / denominator) - \
+                       (exp_lambda_T * (1 - exp_M_lambda_T) / (denominator ** 2))
+        
+        # Добавляем зависимость от времени измерения
+        T_factor = T_factor_base * np.exp(-lambda_i * t_meas)
         
         return T_factor
     
@@ -268,14 +280,14 @@ class FinalEquationSolver:
             # Решение системы Ax = b
             try:
                 # Используем псевдообратную матрицу для стабильности
-                A_pinv = np.linalg.pinv(A, rcond=1e-10)
+                A_pinv = np.linalg.pinv(A, rcond=NUMERICAL_PARAMS['pinv_rcond'])
                 x_solution = A_pinv @ b
                 
                 # Применяем физические ограничения
                 x_solution = np.maximum(x_solution, 0)  # Неотрицательность
                 
                 # Обеспечиваем минимальный вклад каждой группы
-                min_contribution = 0.001 * np.max(x_solution)
+                min_contribution = NUMERICAL_PARAMS['min_contribution_factor'] * np.max(x_solution)
                 x_solution = np.maximum(x_solution, min_contribution * self.abundances)
                 
                 # Сохраняем результаты
@@ -289,7 +301,7 @@ class FinalEquationSolver:
             except np.linalg.LinAlgError as e:
                 logger.warning(f"Проблема с решением для бина {bin_idx}: {e}")
                 # Используем простое решение в случае ошибки
-                x_solution = np.linalg.lstsq(A, b, rcond=1e-10)[0]
+                x_solution = np.linalg.lstsq(A, b, rcond=NUMERICAL_PARAMS['pinv_rcond'])[0]
                 x_solution = np.maximum(x_solution, 0)
                 group_spectra[bin_idx, :] = x_solution
                 uncertainties[bin_idx, :] = 0.1 * np.ones(self.num_groups)
@@ -299,7 +311,10 @@ class FinalEquationSolver:
 class FinalSpectrumAnalyzer:
     """Финальный анализатор спектров ЗН с решением системы уравнений"""
     
-    def __init__(self, num_groups: int = 8):
+    def __init__(self, num_groups: int = None):
+        # Используем количество групп из констант, если не указано
+        if num_groups is None:
+            num_groups = EXPERIMENT_PARAMS['num_groups']
         self.num_groups = num_groups
         self.data_loader = FinalDataLoader()
         self.equation_solver = FinalEquationSolver(num_groups)
@@ -735,8 +750,8 @@ class FinalSpectrumAnalyzer:
 def main():
     """Главная функция"""
     try:
-        # Инициализация анализатора (можно изменить количество групп)
-        num_groups = 8  # Можно изменить на 6 или другое количество
+        # Инициализация анализатора (используем количество групп из констант)
+        num_groups = EXPERIMENT_PARAMS['num_groups']
         analyzer = FinalSpectrumAnalyzer(num_groups)
         
         # Загрузка данных измерений (только измерения!)
