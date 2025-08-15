@@ -176,7 +176,23 @@ class FinalEquationSolver:
                 
                 # Компоненты формулы
                 abundance_factor = a_i / lambda_i
-                irradiation_factor = 1 - np.exp(-lambda_i * t_irr)
+                
+                # Фактор облучения зависит от времени измерения
+                # Если измерение происходит во время облучения, то фактор меньше
+                # Если измерение происходит после облучения, то фактор полный
+                if t_meas <= t_irr:
+                    # Измерение во время облучения
+                    irradiation_factor = 1 - np.exp(-lambda_i * t_meas)
+                else:
+                    # Измерение после облучения
+                    # Для групп с коротким периодом полураспада учитываем затухание после облучения
+                    if lambda_i * t_irr > 5:  # Группа уже насыщена
+                        # Полное насыщение, но затухание после облучения
+                        irradiation_factor = np.exp(-lambda_i * (t_meas - t_irr))
+                    else:
+                        # Обычный фактор облучения
+                        irradiation_factor = 1 - np.exp(-lambda_i * t_irr)
+                
                 decay_factor = np.exp(-lambda_i * self.t_decay)
                 measurement_factor = 1 - np.exp(-lambda_i * self.delta_t)
                 

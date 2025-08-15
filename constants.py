@@ -65,7 +65,7 @@ NUMERICAL_PARAMS = {
 # Параметры для расчета T-фактора
 T_FACTOR_PARAMS = {
     # Использовать упрощенную формулу для T-фактора
-    'use_simplified_formula': True,
+    'use_simplified_formula': False,  # Используем полную формулу для лучшей физики
     
     # Для упрощенной формулы: T_i = M (если M=1)
     'simplified_t_factor': 1.0
