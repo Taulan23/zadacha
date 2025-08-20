@@ -341,16 +341,15 @@ class FinalSpectrumAnalyzer:
         """Анализ спектров с решением системы уравнений"""
         logger.info(f"Запуск анализа для {self.num_groups} групп ЗН...")
         
-        # ОБРЕЗКА ЭНЕРГЕТИЧЕСКОГО ДИАПАЗОНА: исключаем проблемные области
-        # Начинаем с 20 кэВ (как указано пользователем)
-        # Обрезаем до 1200 кэВ для исключения выбросов в конце спектра
+        # ОБРЕЗКА ЭНЕРГЕТИЧЕСКОГО ДИАПАЗОНА: начинаем с 20 кэВ (как указано пользователем)
+        # НО сохраняем полный диапазон до максимальной энергии
         start_idx = np.where(energy_bins >= 20.0)[0][0] if np.any(energy_bins >= 20.0) else 0
-        end_idx = np.where(energy_bins <= 1200.0)[0][-1] if np.any(energy_bins <= 1200.0) else len(energy_bins)
+        end_idx = len(energy_bins)  # Используем весь доступный диапазон
         
-        logger.info(f"Обрезка энергетического диапазона: {energy_bins[start_idx]:.1f} - {energy_bins[end_idx-1]:.1f} кэВ")
+        logger.info(f"Энергетический диапазон: {energy_bins[start_idx]:.1f} - {energy_bins[end_idx-1]:.1f} кэВ")
         logger.info(f"Индексы: {start_idx} - {end_idx-1} (из {len(energy_bins)})")
         
-        # Обрезаем данные
+        # Обрезаем данные только снизу (с 20 кэВ), но сохраняем полный диапазон сверху
         long_data_trimmed = long_data[:, start_idx:end_idx]
         short_data_trimmed = short_data[:, start_idx:end_idx]
         energy_bins_trimmed = energy_bins[start_idx:end_idx]
@@ -406,9 +405,18 @@ class FinalSpectrumAnalyzer:
             # Дополнительная фильтрация экстремальных выбросов
             median_val = np.median(filtered_spectrum[filtered_spectrum > 0])
             if median_val > 0:
-                # Ограничиваем значения не более чем в 10 раз больше медианы
-                max_allowed = median_val * 10
+                # Ограничиваем значения не более чем в 5 раз больше медианы (более строго)
+                max_allowed = median_val * 5
                 filtered_spectrum = np.minimum(filtered_spectrum, max_allowed)
+                
+                # Дополнительная фильтрация для высокоэнергетической области (>1000 кэВ)
+                # где часто возникают выбросы
+                high_energy_mask = np.arange(len(filtered_spectrum)) > len(filtered_spectrum) * 0.8  # Последние 20% спектра
+                if np.any(high_energy_mask):
+                    high_energy_median = np.median(filtered_spectrum[high_energy_mask & (filtered_spectrum > 0)])
+                    if high_energy_median > 0:
+                        high_energy_max = high_energy_median * 3  # Более строгое ограничение для высоких энергий
+                        filtered_spectrum[high_energy_mask] = np.minimum(filtered_spectrum[high_energy_mask], high_energy_max)
             
             # Масштабирование с учетом физических констант
             abundance = self.data_loader.group_constants['relative_abundances'][group]
