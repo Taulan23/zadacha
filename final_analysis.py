@@ -341,16 +341,30 @@ class FinalSpectrumAnalyzer:
         """Анализ спектров с решением системы уравнений"""
         logger.info(f"Запуск анализа для {self.num_groups} групп ЗН...")
         
+        # ОБРЕЗКА ЭНЕРГЕТИЧЕСКОГО ДИАПАЗОНА: исключаем проблемные области
+        # Начинаем с 20 кэВ (как указано пользователем)
+        # Обрезаем до 1200 кэВ для исключения выбросов в конце спектра
+        start_idx = np.where(energy_bins >= 20.0)[0][0] if np.any(energy_bins >= 20.0) else 0
+        end_idx = np.where(energy_bins <= 1200.0)[0][-1] if np.any(energy_bins <= 1200.0) else len(energy_bins)
+        
+        logger.info(f"Обрезка энергетического диапазона: {energy_bins[start_idx]:.1f} - {energy_bins[end_idx-1]:.1f} кэВ")
+        logger.info(f"Индексы: {start_idx} - {end_idx-1} (из {len(energy_bins)})")
+        
+        # Обрезаем данные
+        long_data_trimmed = long_data[:, start_idx:end_idx]
+        short_data_trimmed = short_data[:, start_idx:end_idx]
+        energy_bins_trimmed = energy_bins[start_idx:end_idx]
+        
         # Решение для длинного облучения
         logger.info("Решение для данных длинного облучения...")
         long_spectra, long_uncertainties, long_coefficients = self.equation_solver.solve_equations(
-            long_data, 'long'
+            long_data_trimmed, 'long'
         )
         
         # Решение для короткого облучения
         logger.info("Решение для данных короткого облучения...")
         short_spectra, short_uncertainties, short_coefficients = self.equation_solver.solve_equations(
-            short_data, 'short'
+            short_data_trimmed, 'short'
         )
         
         # Применение физических ограничений
@@ -364,7 +378,7 @@ class FinalSpectrumAnalyzer:
             'short_uncertainties': short_uncertainties,
             'long_coefficients': long_coefficients,
             'short_coefficients': short_coefficients,
-            'energy_bins': energy_bins
+            'energy_bins': energy_bins_trimmed
         }
     
     def _apply_physical_constraints(self, spectra: np.ndarray) -> np.ndarray:
@@ -385,6 +399,17 @@ class FinalSpectrumAnalyzer:
             # ОГРАНИЧЕНИЕ: спектры не могут быть отрицательными
             group_spectrum = np.maximum(group_spectrum, 0)
             
+            # ФИЛЬТРАЦИЯ ВЫБРОСОВ: применяем медианный фильтр для устранения выбросов
+            from scipy.signal import medfilt
+            filtered_spectrum = medfilt(group_spectrum, kernel_size=5)
+            
+            # Дополнительная фильтрация экстремальных выбросов
+            median_val = np.median(filtered_spectrum[filtered_spectrum > 0])
+            if median_val > 0:
+                # Ограничиваем значения не более чем в 10 раз больше медианы
+                max_allowed = median_val * 10
+                filtered_spectrum = np.minimum(filtered_spectrum, max_allowed)
+            
             # Масштабирование с учетом физических констант
             abundance = self.data_loader.group_constants['relative_abundances'][group]
             half_life = self.data_loader.group_constants['half_lives'][group]
@@ -392,13 +417,13 @@ class FinalSpectrumAnalyzer:
             # Специальная обработка для групп с очень коротким периодом полураспада
             if half_life < 0.1:  # Группы 7, 8
                 # Эти группы должны иметь очень низкую интенсивность
-                scaled_spectrum = group_spectrum * abundance * 10
+                scaled_spectrum = filtered_spectrum * abundance * 10
             elif half_life < 0.5:  # Группа 6
                 # Группа 6 должна иметь умеренную интенсивность
-                scaled_spectrum = group_spectrum * abundance * 50
+                scaled_spectrum = filtered_spectrum * abundance * 50
             else:
                 # Обычное масштабирование для остальных групп
-                scaled_spectrum = group_spectrum * abundance * 100
+                scaled_spectrum = filtered_spectrum * abundance * 100
             
             constrained[:, group] = scaled_spectrum
         
