@@ -52,7 +52,7 @@ class FinalDataLoader:
             logger.info("Загрузка данных короткого облучения...")
             df_short = pd.read_excel(file_path, sheet_name='Spectra tirr=20s ', header=1)
             
-            # Извлекаем энергетические бины (первый столбец)
+            # Извлекаем энергетические бины (первый столбец), пропуская заголовки
             energy_col = df_long.columns[0]
             energy_bins = df_long[energy_col].dropna().values
             
@@ -72,14 +72,14 @@ class FinalDataLoader:
             logger.info(f"Найдено {len(short_columns)} интервалов короткого облучения")
             logger.info(f"Энергетических бинов: {len(energy_bins)}")
             
-            # Создаем массивы данных
-            long_data = df_long[long_columns].dropna().values.T
-            short_data = df_short[short_columns].dropna().values.T
+            # Создаем массивы данных, пропуская первую строку с заголовками
+            long_data = df_long[long_columns].iloc[1:].dropna().values.T
+            short_data = df_short[short_columns].iloc[1:].dropna().values.T
             
             # Преобразуем в числовой формат
             long_data = pd.DataFrame(long_data).apply(pd.to_numeric, errors='coerce').values
             short_data = pd.DataFrame(short_data).apply(pd.to_numeric, errors='coerce').values
-            energy_bins = pd.to_numeric(energy_bins, errors='coerce')
+            energy_bins = pd.to_numeric(energy_bins[1:], errors='coerce')  # Пропускаем первый элемент
             
             # Проверяем и корректируем размерности
             min_bins = min(long_data.shape[1], short_data.shape[1], len(energy_bins))
@@ -91,6 +91,12 @@ class FinalDataLoader:
             logger.info(f"  Длинное облучение: {long_data.shape}")
             logger.info(f"  Короткое облучение: {short_data.shape}")
             logger.info(f"  Энергетические бины: {len(energy_bins)}")
+            
+            # Проверяем качество данных
+            logger.info(f"Статистика данных длинного облучения:")
+            logger.info(f"  Минимум: {np.min(long_data):.6f}")
+            logger.info(f"  Максимум: {np.max(long_data):.6f}")
+            logger.info(f"  Среднее: {np.mean(long_data):.6f}")
             
             return long_data, short_data, energy_bins
             
