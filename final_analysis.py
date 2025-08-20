@@ -352,10 +352,9 @@ class FinalSpectrumAnalyzer:
         """Анализ спектров с решением системы уравнений"""
         logger.info(f"Запуск анализа для {self.num_groups} групп ЗН...")
         
-        # ОБРЕЗКА ЭНЕРГЕТИЧЕСКОГО ДИАПАЗОНА: начинаем с 10 кэВ (как указано пользователем)
-        # НО сохраняем полный диапазон до максимальной энергии
+        # ОБРЕЗКА ЭНЕРГЕТИЧЕСКОГО ДИАПАЗОНА: начинаем с 10 кэВ, обрезаем до 1000 кэВ для устранения выбросов
         start_idx = np.where(energy_bins >= 10.0)[0][0] if np.any(energy_bins >= 10.0) else 0
-        end_idx = len(energy_bins)  # Используем весь доступный диапазон
+        end_idx = np.where(energy_bins <= 1000.0)[0][-1] if np.any(energy_bins <= 1000.0) else len(energy_bins)
         
         logger.info(f"Энергетический диапазон: {energy_bins[start_idx]:.1f} - {energy_bins[end_idx-1]:.1f} кэВ")
         logger.info(f"Индексы: {start_idx} - {end_idx-1} (из {len(energy_bins)})")
@@ -409,25 +408,41 @@ class FinalSpectrumAnalyzer:
             # ОГРАНИЧЕНИЕ: спектры не могут быть отрицательными
             group_spectrum = np.maximum(group_spectrum, 0)
             
-            # ФИЛЬТРАЦИЯ ВЫБРОСОВ: мягкая фильтрация без создания повторов
-            # Используем скользящее среднее для сглаживания, но сохраняем уникальность значений
-            from scipy.signal import savgol_filter
+            # ФИЛЬТРАЦИЯ ВЫБРОСОВ: строгая фильтрация экстремальных выбросов
+            # Применяем многоуровневую фильтрацию для устранения выбросов
             
-            # Применяем фильтр Савицкого-Голея для сглаживания без потери деталей
-            if len(group_spectrum) > 5:
-                try:
-                    smoothed_spectrum = savgol_filter(group_spectrum, window_length=5, polyorder=2)
-                except:
-                    smoothed_spectrum = group_spectrum
+            # 1. Базовая медианная фильтрация для устранения точечных выбросов
+            from scipy.signal import medfilt
+            if len(group_spectrum) > 3:
+                median_filtered = medfilt(group_spectrum, kernel_size=3)
             else:
-                smoothed_spectrum = group_spectrum
+                median_filtered = group_spectrum
             
-            # Ограничиваем только экстремальные выбросы, не создавая повторов
+            # 2. Сглаживание фильтром Савицкого-Голея
+            from scipy.signal import savgol_filter
+            if len(median_filtered) > 5:
+                try:
+                    smoothed_spectrum = savgol_filter(median_filtered, window_length=5, polyorder=2)
+                except:
+                    smoothed_spectrum = median_filtered
+            else:
+                smoothed_spectrum = median_filtered
+            
+            # 3. Строгое ограничение выбросов
             median_val = np.median(smoothed_spectrum[smoothed_spectrum > 0])
             if median_val > 0:
-                # Ограничиваем только значения, которые превышают медиану в 10 раз
-                max_allowed = median_val * 10
+                # Ограничиваем значения не более чем в 2 раза больше медианы (очень строго)
+                max_allowed = median_val * 2
                 filtered_spectrum = np.where(smoothed_spectrum > max_allowed, max_allowed, smoothed_spectrum)
+                
+                # 4. Дополнительная фильтрация для высокоэнергетической области (>800 кэВ)
+                high_energy_mask = np.arange(len(filtered_spectrum)) > len(filtered_spectrum) * 0.5  # Последние 50% спектра
+                if np.any(high_energy_mask):
+                    high_energy_median = np.median(filtered_spectrum[high_energy_mask & (filtered_spectrum > 0)])
+                    if high_energy_median > 0:
+                        # Очень строгое ограничение для высоких энергий
+                        high_energy_max = high_energy_median * 1.5
+                        filtered_spectrum[high_energy_mask] = np.minimum(filtered_spectrum[high_energy_mask], high_energy_max)
             else:
                 filtered_spectrum = smoothed_spectrum
             
