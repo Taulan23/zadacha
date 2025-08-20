@@ -10,7 +10,7 @@ from typing import Dict, Tuple, Optional
 import os
 from datetime import datetime
 import warnings
-from constants import GROUP_CONSTANTS, EXPERIMENT_PARAMS, NUMERICAL_PARAMS, T_FACTOR_PARAMS
+from constants import GROUP_CONSTANTS, EXPERIMENT_PARAMS, NUMERICAL_PARAMS, T_FACTOR_PARAMS, MEASUREMENT_INTERVALS
 
 warnings.filterwarnings('ignore')
 
@@ -56,17 +56,30 @@ class FinalDataLoader:
             energy_col = df_long.columns[0]
             energy_bins = df_long[energy_col].dropna().values
             
-            # Извлекаем данные спектров (все столбцы кроме первого)
-            long_columns = [col for col in df_long.columns[1:] if not pd.isna(col) and str(col).strip() != '']
-            short_columns = [col for col in df_short.columns[1:] if not pd.isna(col) and str(col).strip() != '']
+            # Извлекаем только основные данные спектров (столбцы N(En), n/10 keV)
+            long_columns = []
+            short_columns = []
             
-            logger.info(f"Найдено {len(long_columns)} столбцов длинного облучения")
-            logger.info(f"Найдено {len(short_columns)} столбцов короткого облучения")
+            for col in df_long.columns[1:]:
+                if 'N(En), n/10 keV' in str(col) and not pd.isna(col):
+                    long_columns.append(col)
+            
+            for col in df_short.columns[1:]:
+                if 'N(En), n/10 keV' in str(col) and not pd.isna(col):
+                    short_columns.append(col)
+            
+            logger.info(f"Найдено {len(long_columns)} интервалов длинного облучения")
+            logger.info(f"Найдено {len(short_columns)} интервалов короткого облучения")
             logger.info(f"Энергетических бинов: {len(energy_bins)}")
             
             # Создаем массивы данных
             long_data = df_long[long_columns].dropna().values.T
             short_data = df_short[short_columns].dropna().values.T
+            
+            # Преобразуем в числовой формат
+            long_data = pd.DataFrame(long_data).apply(pd.to_numeric, errors='coerce').values
+            short_data = pd.DataFrame(short_data).apply(pd.to_numeric, errors='coerce').values
+            energy_bins = pd.to_numeric(energy_bins, errors='coerce')
             
             # Проверяем и корректируем размерности
             min_bins = min(long_data.shape[1], short_data.shape[1], len(energy_bins))
@@ -123,36 +136,47 @@ class FinalEquationSolver:
         self.half_lives = np.array(GROUP_CONSTANTS['half_lives'][:num_groups])
         self.decay_constants = np.log(2) / self.half_lives
         
-        # Параметры эксперимента из файла
-        self.t_irr_long = EXPERIMENT_PARAMS['irradiation_times']['long']
-        self.t_irr_short = EXPERIMENT_PARAMS['irradiation_times']['short']
-        self.t_decay = EXPERIMENT_PARAMS['decay_time']
-        self.delta_t = EXPERIMENT_PARAMS['measurement_time']
-        self.T = EXPERIMENT_PARAMS['measurement_period']
-        self.M = EXPERIMENT_PARAMS['num_cycles']
+        # Параметры интервалов измерения
+        self.measurement_intervals = MEASUREMENT_INTERVALS
+        self.num_intervals = EXPERIMENT_PARAMS['num_intervals']
     
-    def create_sensitivity_matrix(self, t_irr: float, num_measurements: int) -> Tuple[np.ndarray, Dict]:
+    def create_sensitivity_matrix(self, irradiation_type: str, num_measurements: int) -> Tuple[np.ndarray, Dict]:
         """
-        Создание матрицы чувствительности A^l_ij согласно уравнению:
-        A^l_ij = (a_i / λ_i) * (1 - e^(-λ_i * t_irr)) * (e^(-λ_i * t_decay)) * (1 - e^(-λ_i * delta_t)) * T_i
-        где T_i = [M / (1 - e^(-λ_i * T)) - e^(-λ_i * T) * (1 - e^(-M * λ_i * T)) / (1 - e^(-λ_i * T))^2]
+        Создание матрицы чувствительности A^l_ij для каждого интервала измерения
+        с учетом индивидуальных параметров td, tc, t1, t2 для каждого измерения
         
-        Возвращает:
+        Args:
+            irradiation_type: 'long' или 'short' - тип облучения
+            num_measurements: количество измерений (должно быть равно количеству интервалов)
+        
+        Returns:
             Матрицу A и детальную информацию о всех коэффициентах
         """
+        # Получаем параметры для данного типа облучения
+        if irradiation_type == 'long':
+            intervals_data = self.measurement_intervals['long_irradiation']
+        elif irradiation_type == 'short':
+            intervals_data = self.measurement_intervals['short_irradiation']
+        else:
+            raise ValueError(f"Неизвестный тип облучения: {irradiation_type}")
+        
+        t_irr = intervals_data['tirr']
+        intervals = intervals_data['intervals']
+        
+        # Проверяем соответствие количества измерений и интервалов
+        if num_measurements != len(intervals):
+            logger.warning(f"Количество измерений ({num_measurements}) не совпадает с количеством интервалов ({len(intervals)})")
+            logger.info(f"Используем количество интервалов из данных: {len(intervals)}")
+            num_measurements = len(intervals)
+        
         A = np.zeros((num_measurements, self.num_groups))
         coefficients_info = {
-            'measurement_times': [],
+            'irradiation_type': irradiation_type,
+            't_irr': t_irr,
+            'intervals': intervals,
             'group_coefficients': {},
             'matrix_normalization': 0.0
         }
-        
-        # Расчет времен измерения
-        measurement_times = []
-        for i in range(num_measurements):
-            t_meas = i * self.T / (num_measurements - 1)
-            measurement_times.append(t_meas)
-        coefficients_info['measurement_times'] = measurement_times
         
         # Расчет коэффициентов для каждой группы
         for j in range(self.num_groups):
@@ -168,11 +192,13 @@ class FinalEquationSolver:
                 'measurements': []
             }
             
-            for i in range(num_measurements):
-                t_meas = measurement_times[i]
-                
-                # Расчет T_i фактора
-                T_factor = self._calculate_T_factor(lambda_i, t_meas)
+            for i in range(min(num_measurements, len(intervals))):
+                # Получаем параметры для данного интервала
+                interval = intervals[i]
+                td = interval['td']      # Время распада после облучения
+                tc = interval['tc']      # Время измерения
+                t1 = interval['t1']      # Начало интервала измерения
+                t2 = interval['t2']      # Конец интервала измерения
                 
                 # Компоненты формулы согласно правильной физике эксперимента
                 abundance_factor = a_i / lambda_i
@@ -180,11 +206,14 @@ class FinalEquationSolver:
                 # Фактор облучения - всегда полное облучение
                 irradiation_factor = 1 - np.exp(-lambda_i * t_irr)
                 
-                # Фактор распада после облучения до начала измерения (t_decay = 0.12с)
-                decay_factor = np.exp(-lambda_i * self.t_decay)
+                # Фактор распада после облучения до начала измерения (td)
+                decay_factor = np.exp(-lambda_i * td)
                 
-                # Фактор измерения на интервале (delta_t = 0.88с)
-                measurement_factor = 1 - np.exp(-lambda_i * self.delta_t)
+                # Фактор измерения на интервале (tc = t2 - t1)
+                measurement_factor = 1 - np.exp(-lambda_i * tc)
+                
+                # T-фактор для данного интервала (упрощенная формула)
+                T_factor = np.exp(-lambda_i * t1)  # Зависит от времени начала измерения
                 
                 # Основная формула
                 A_component = abundance_factor * irradiation_factor * decay_factor * measurement_factor * T_factor
@@ -201,7 +230,11 @@ class FinalEquationSolver:
                 # Сохранение детальной информации
                 measurement_info = {
                     'measurement_index': i,
-                    'time': t_meas,
+                    'interval': i + 1,
+                    'td': td,
+                    'tc': tc,
+                    't1': t1,
+                    't2': t2,
                     'abundance_factor': abundance_factor,
                     'irradiation_factor': irradiation_factor,
                     'decay_factor': decay_factor,
@@ -223,57 +256,26 @@ class FinalEquationSolver:
         
         return A, coefficients_info
     
-    def _calculate_T_factor(self, lambda_i: float, t_meas: float) -> float:
-        """
-        Расчет T_i фактора с учетом времени измерения:
-        T_i = e^(-λ_i * t_meas) * [M / (1 - e^(-λ_i * T)) - e^(-λ_i * T) * (1 - e^(-M * λ_i * T)) / (1 - e^(-λ_i * T))^2]
-        
-        Или упрощенная формула для M=1:
-        T_i = e^(-λ_i * t_meas)
-        """
-        if T_FACTOR_PARAMS['use_simplified_formula'] and self.M == 1:
-            # Упрощенная формула для M=1
-            return np.exp(-lambda_i * t_meas)
-        
-        # Полная формула
-        if lambda_i * self.T < NUMERICAL_PARAMS['zero_threshold']:
-            return self.M * np.exp(-lambda_i * t_meas)
-        
-        exp_lambda_T = np.exp(-lambda_i * self.T)
-        exp_M_lambda_T = np.exp(-self.M * lambda_i * self.T)
-        
-        denominator = 1 - exp_lambda_T
-        
-        if abs(denominator) < NUMERICAL_PARAMS['zero_threshold']:
-            return self.M * np.exp(-lambda_i * t_meas)
-        
-        T_factor_base = (self.M / denominator) - \
-                       (exp_lambda_T * (1 - exp_M_lambda_T) / (denominator ** 2))
-        
-        # Добавляем зависимость от времени измерения
-        T_factor = T_factor_base * np.exp(-lambda_i * t_meas)
-        
-        return T_factor
+
     
-    def solve_equations(self, measurements: np.ndarray, t_irr: float) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    def solve_equations(self, measurements: np.ndarray, irradiation_type: str) -> Tuple[np.ndarray, np.ndarray, Dict]:
         """
         Решение системы уравнений: N^l_i(E_n) = Σ A^l_ij · x_j(E_n)
-        для каждого энергетического бина E_n
+        для каждого энергетического бина E_n с учетом индивидуальных параметров интервалов
         
-        Возвращает:
+        Args:
+            measurements: массив измерений (num_measurements x num_energy_bins)
+            irradiation_type: 'long' или 'short' - тип облучения
+        
+        Returns:
             group_spectra, uncertainties, coefficients_info
         """
         num_measurements, num_energy_bins = measurements.shape
         
         # Создаем матрицу чувствительности с детальной информацией
-        A, coefficients_info = self.create_sensitivity_matrix(t_irr, num_measurements)
+        A, coefficients_info = self.create_sensitivity_matrix(irradiation_type, num_measurements)
         
-        # Добавляем параметры облучения к информации
-        coefficients_info['irradiation_time'] = t_irr
-        coefficients_info['t_decay'] = self.t_decay
-        coefficients_info['delta_t'] = self.delta_t
-        coefficients_info['T'] = self.T
-        coefficients_info['M'] = self.M
+        # Добавляем дополнительную информацию
         coefficients_info['num_measurements'] = num_measurements
         coefficients_info['num_energy_bins'] = num_energy_bins
         
@@ -336,13 +338,13 @@ class FinalSpectrumAnalyzer:
         # Решение для длинного облучения
         logger.info("Решение для данных длинного облучения...")
         long_spectra, long_uncertainties, long_coefficients = self.equation_solver.solve_equations(
-            long_data, self.equation_solver.t_irr_long
+            long_data, 'long'
         )
         
         # Решение для короткого облучения
         logger.info("Решение для данных короткого облучения...")
         short_spectra, short_uncertainties, short_coefficients = self.equation_solver.solve_equations(
-            short_data, self.equation_solver.t_irr_short
+            short_data, 'short'
         )
         
         # Применение физических ограничений
@@ -587,13 +589,13 @@ class FinalSpectrumAnalyzer:
         # Добавляем общую информацию о параметрах
         details_data.append({
             'Группа': 'Параметры облучения',
-            'Номер измерения': '',
-            'Время (с)': '',
-            'Время облучения (с)': coefficients_info['irradiation_time'],
-            'Время распада (с)': coefficients_info['t_decay'],
-            'Время измерения (с)': coefficients_info['delta_t'],
-            'Период T (с)': coefficients_info['T'],
-            'Количество циклов M': coefficients_info['M'],
+            'Интервал': '',
+            'Тип облучения': coefficients_info['irradiation_type'],
+            'Время облучения (с)': coefficients_info['t_irr'],
+            'td (с)': '',
+            'tc (с)': '',
+            't1 (с)': '',
+            't2 (с)': '',
             'Нормализация матрицы': coefficients_info['matrix_normalization'],
             'Относительная распространенность': '',
             'Период полураспада (с)': '',
@@ -642,13 +644,13 @@ class FinalSpectrumAnalyzer:
             for meas in group_info['measurements']:
                 details_data.append({
                     'Группа': '',
-                    'Номер измерения': meas['measurement_index'],
-                    'Время (с)': f"{meas['time']:.3f}",
+                    'Интервал': meas['interval'],
+                    'Тип облучения': '',
                     'Время облучения (с)': '',
-                    'Время распада (с)': '',
-                    'Время измерения (с)': '',
-                    'Период T (с)': '',
-                    'Количество циклов M': '',
+                    'td (с)': f"{meas['td']:.3f}",
+                    'tc (с)': f"{meas['tc']:.3f}",
+                    't1 (с)': f"{meas['t1']:.3f}",
+                    't2 (с)': f"{meas['t2']:.3f}",
                     'Нормализация матрицы': '',
                     'Относительная распространенность': '',
                     'Период полураспада (с)': '',
@@ -670,13 +672,13 @@ class FinalSpectrumAnalyzer:
     def _save_coefficients_summary(self, writer, coefficients_info: Dict, sheet_name: str):
         """Сохранение сводной матрицы коэффициентов"""
         # Создаем матрицу коэффициентов
-        num_measurements = len(coefficients_info['measurement_times'])
+        num_measurements = len(coefficients_info['group_coefficients']['group_1']['measurements'])
         num_groups = len(coefficients_info['group_coefficients'])
         
         matrix_data = []
         
-        # Заголовок с временами измерения
-        header_row = ['Группа\\Время (с)'] + [f"{t:.3f}" for t in coefficients_info['measurement_times']]
+        # Заголовок с интервалами измерения
+        header_row = ['Группа\\Интервал'] + [f"Интервал {i+1}" for i in range(num_measurements)]
         matrix_data.append(dict(zip(range(len(header_row)), header_row)))
         
         # Данные для каждой группы
@@ -731,13 +733,16 @@ class FinalSpectrumAnalyzer:
         # Информация о длинном облучении
         long_coeff = results['long_coefficients']
         print(f"\nДЛИННОЕ ОБЛУЧЕНИЕ:")
-        print(f"  Время облучения: {long_coeff['irradiation_time']:.1f} с")
-        print(f"  Время распада: {long_coeff['t_decay']:.1f} с")
-        print(f"  Время измерения: {long_coeff['delta_t']:.1f} с")
-        print(f"  Период T: {long_coeff['T']:.1f} с")
-        print(f"  Количество циклов M: {long_coeff['M']}")
+        print(f"  Тип облучения: {long_coeff['irradiation_type']}")
+        print(f"  Время облучения: {long_coeff['t_irr']:.1f} с")
+        print(f"  Количество интервалов: {len(long_coeff['intervals'])}")
         print(f"  Количество измерений: {long_coeff['num_measurements']}")
         print(f"  Нормализация матрицы: {long_coeff['matrix_normalization']:.6e}")
+        
+        # Информация об интервалах
+        print(f"\n  ПАРАМЕТРЫ ИНТЕРВАЛОВ:")
+        for i, interval in enumerate(long_coeff['intervals']):
+            print(f"    Интервал {i+1}: td={interval['td']:.2f}с, tc={interval['tc']:.2f}с, t1={interval['t1']:.2f}с, t2={interval['t2']:.2f}с")
         
         # Краткая информация о коэффициентах групп
         print(f"\n  КОЭФФИЦИЕНТЫ ПО ГРУППАМ (образец):")
@@ -749,8 +754,8 @@ class FinalSpectrumAnalyzer:
                 print(f"    Группа {group_num}:")
                 print(f"      Распространенность: {group_info['abundance']:.3f}")
                 print(f"      Период полураспада: {group_info['half_life']:.2f} с")
-                print(f"      Первый коэффициент A[0,{group_num-1}]: {first_meas['final_coefficient']:.6e}")
-                print(f"      Последний коэффициент A[{long_coeff['num_measurements']-1},{group_num-1}]: {last_meas['final_coefficient']:.6e}")
+                print(f"      Коэффициент для интервала 1: {first_meas['final_coefficient']:.6e}")
+                print(f"      Коэффициент для интервала {len(long_coeff['intervals'])}: {last_meas['final_coefficient']:.6e}")
         
         if len(long_coeff['group_coefficients']) > 3:
             print(f"    ... и ещё {len(long_coeff['group_coefficients']) - 3} групп")
@@ -758,9 +763,16 @@ class FinalSpectrumAnalyzer:
         # Информация о коротком облучении
         short_coeff = results['short_coefficients']
         print(f"\nКОРОТКОЕ ОБЛУЧЕНИЕ:")
-        print(f"  Время облучения: {short_coeff['irradiation_time']:.1f} с")
+        print(f"  Тип облучения: {short_coeff['irradiation_type']}")
+        print(f"  Время облучения: {short_coeff['t_irr']:.1f} с")
+        print(f"  Количество интервалов: {len(short_coeff['intervals'])}")
         print(f"  Количество измерений: {short_coeff['num_measurements']}")
         print(f"  Нормализация матрицы: {short_coeff['matrix_normalization']:.6e}")
+        
+        # Информация об интервалах
+        print(f"\n  ПАРАМЕТРЫ ИНТЕРВАЛОВ:")
+        for i, interval in enumerate(short_coeff['intervals']):
+            print(f"    Интервал {i+1}: td={interval['td']:.2f}с, tc={interval['tc']:.2f}с, t1={interval['t1']:.2f}с, t2={interval['t2']:.2f}с")
         
         print(f"\nПОДРОБНАЯ ИНФОРМАЦИЯ О ВСЕХ КОЭФФИЦИЕНТАХ СОХРАНЕНА В EXCEL:")
         print(f"  - Листы 'Коэффициенты_длинное' и 'Коэффициенты_короткое'")
